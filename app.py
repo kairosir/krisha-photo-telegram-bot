@@ -43,6 +43,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Krisha Telegram Bot", lifespan=lifespan)
 
 
+def _verify_secret(request: Request, header_name: str) -> str:
+    settings = get_settings()
+    expected = settings.webhook_secret.get_secret_value() if settings.webhook_secret else ""
+    received = request.headers.get(header_name, "")
+    if not expected or not hmac.compare_digest(received, expected):
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    return expected
+
+
 @app.get("/")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "krisha-telegram-bot"}
@@ -50,11 +59,7 @@ async def health() -> dict[str, str]:
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request) -> dict[str, bool]:
-    settings = get_settings()
-    expected = settings.webhook_secret.get_secret_value() if settings.webhook_secret else ""
-    received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not expected or not hmac.compare_digest(received, expected):
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    _verify_secret(request, "X-Telegram-Bot-Api-Secret-Token")
 
     try:
         payload = await request.json()
@@ -67,3 +72,30 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         logger.exception("Ошибка обработки Telegram webhook")
         raise HTTPException(status_code=500, detail="Webhook processing failed")
     return {"ok": True}
+
+
+@app.post("/admin/setup-webhook")
+async def setup_webhook(request: Request) -> dict[str, str | bool]:
+    secret = _verify_secret(request, "X-Setup-Secret")
+    bot, _ = _components()
+    webhook_url = f"{str(request.base_url).rstrip('/')}/telegram/webhook"
+    result = await bot.set_webhook(
+        webhook_url,
+        secret_token=secret,
+        allowed_updates=["message"],
+        drop_pending_updates=False,
+    )
+    return {"ok": result, "webhook_url": webhook_url}
+
+
+@app.get("/admin/webhook-info")
+async def webhook_info(request: Request) -> dict[str, object]:
+    _verify_secret(request, "X-Setup-Secret")
+    bot, _ = _components()
+    info = await bot.get_webhook_info()
+    return {
+        "url": info.url,
+        "pending_update_count": info.pending_update_count,
+        "last_error_date": info.last_error_date.isoformat() if info.last_error_date else None,
+        "last_error_message": info.last_error_message,
+    }

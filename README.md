@@ -96,6 +96,8 @@ python -m scripts.set_webhook https://your-project.vercel.app
 
 Корневой URL `/` служит health-check. Webhook доступен на `/telegram/webhook` и проверяет заголовок `X-Telegram-Bot-Api-Secret-Token`.
 
+Для автоматической регистрации без передачи `BOT_TOKEN` наружу предусмотрен защищённый `POST /admin/setup-webhook`. Он принимает `WEBHOOK_SECRET` в заголовке `X-Setup-Secret`. Состояние можно проверить через защищённый `GET /admin/webhook-info`.
+
 ## Настройки `.env`
 
 | Переменная | Значение по умолчанию | Назначение |
