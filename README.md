@@ -10,6 +10,7 @@
 .
 ├── main.py                     # точка входа и polling
 ├── app.py                      # FastAPI webhook для Vercel
+├── api/index.py                # точка входа Vercel Python Function
 ├── config.py                   # типизированные настройки из .env
 ├── handlers/
 │   ├── commands.py             # /start, /help, /cancel

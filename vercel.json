@@ -2,9 +2,15 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "fluid": true,
   "functions": {
-    "app.py": {
+    "api/index.py": {
       "maxDuration": 300,
       "excludeFiles": "{tests/**,work/**,outputs/**,.git/**,.venv/**}"
     }
-  }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
+  ]
 }
