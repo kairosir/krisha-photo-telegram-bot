@@ -1,0 +1,10 @@
+aiogram>=3.13,<4
+aiohttp>=3.10,<4
+beautifulsoup4>=4.12,<5
+lxml>=5.2,<7
+Pillow>=10.4,<13
+opencv-python-headless>=4.10,<5
+numpy>=1.26,<3
+pydantic-settings>=2.4,<3
+python-dotenv>=1.0,<2
+fastapi>=0.115,<1
