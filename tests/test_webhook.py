@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app import _dispatch_update
+from bot.main import _dispatch_update
 
 
 class WebhookDispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -13,8 +13,8 @@ class WebhookDispatchTests(unittest.IsolatedAsyncioTestCase):
         database = object()
 
         with (
-            patch("app.get_settings", return_value=settings),
-            patch("app._get_database", return_value=database),
+            patch("bot.main.get_settings", return_value=settings),
+            patch("bot.main._get_database", return_value=database),
         ):
             await _dispatch_update(bot, dispatcher, update)  # type: ignore[arg-type]
 

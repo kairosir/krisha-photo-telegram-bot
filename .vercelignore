@@ -6,5 +6,6 @@
 work
 outputs
 tests
+temp
 __pycache__
 *.pyc

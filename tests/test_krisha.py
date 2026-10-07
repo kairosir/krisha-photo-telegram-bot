@@ -1,6 +1,7 @@
 import unittest
 
-from services.krisha import extract_image_urls, validate_listing_url
+from services.source import extract_image_urls
+from utils.validators import validate_listing_url
 
 
 class ValidateListingUrlTests(unittest.TestCase):

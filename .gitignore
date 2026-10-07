@@ -11,6 +11,10 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 tmp/
+temp/input/*
+!temp/input/.gitkeep
+temp/output/*
+!temp/output/.gitkeep
 work/
 outputs/
 *.log

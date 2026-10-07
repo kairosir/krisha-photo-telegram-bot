@@ -18,4 +18,4 @@ COPY . .
 RUN useradd --create-home --uid 10001 botuser && chown -R botuser:botuser /app
 USER botuser
 
-CMD ["python", "main.py"]
+CMD ["python", "-m", "bot.main"]
