@@ -52,6 +52,10 @@ def _verify_secret(request: Request, header_name: str) -> str:
     return expected
 
 
+async def _dispatch_update(bot: Bot, dispatcher: Dispatcher, update: Update) -> None:
+    await dispatcher.feed_update(bot, update, settings=get_settings())
+
+
 @app.get("/")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "krisha-telegram-bot"}
@@ -65,7 +69,7 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         payload = await request.json()
         bot, dispatcher = _components()
         update = Update.model_validate(payload, context={"bot": bot})
-        await dispatcher.feed_update(bot, update)
+        await _dispatch_update(bot, dispatcher, update)
     except HTTPException:
         raise
     except Exception:
