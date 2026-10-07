@@ -7,6 +7,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import Message
 
 from config import Settings
+from services.database import Database
 from services.image_processor import ImageProcessor
 from services.krisha import (
     AccessRestrictedError,
@@ -41,7 +42,7 @@ def _get_processing_semaphore(limit: int) -> asyncio.Semaphore:
     return _processing_semaphore
 
 
-async def _process_listing(message: Message, bot: Bot, settings: Settings, url: str) -> None:
+async def _process_listing(message: Message, bot: Bot, settings: Settings, url: str) -> int:
     await message.answer("🔎 Получаю фотографии объявления…")
     timeout = aiohttp.ClientTimeout(total=settings.http_timeout_seconds)
     headers = {
@@ -86,10 +87,16 @@ async def _process_listing(message: Message, bot: Bot, settings: Settings, url: 
                     caption="Оригиналы без сжатия",
                 )
             await message.answer(f"✅ Готово!\nОбработано фотографий: {len(processed)}")
+            return len(processed)
 
 
 @router.message(F.text)
-async def listing_handler(message: Message, bot: Bot, settings: Settings) -> None:
+async def listing_handler(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    database: Database,
+) -> None:
     if not message.from_user or not message.text:
         return
     url = validate_listing_url(message.text.strip())
@@ -111,21 +118,27 @@ async def listing_handler(message: Message, bot: Bot, settings: Settings) -> Non
         if task is not None:
             _active_tasks[user_id] = task
 
+    job_id = await database.create_job(user_id, url)
     try:
-        await _process_listing(message, bot, settings, url)
+        processed_count = await _process_listing(message, bot, settings, url)
+        await database.complete_job(job_id, processed_count)
     except asyncio.CancelledError:
+        await database.cancel_job(job_id)
         logger.info("Задача пользователя %s отменена", user_id)
         raise
     except (AccessRestrictedError, ListingUnavailableError) as exc:
+        await database.fail_job(job_id, str(exc))
         logger.warning("Объявление недоступно для пользователя %s: %s", user_id, exc)
         await message.answer(
             "❌ Не удалось получить фотографии объявления. Возможно, объявление удалено "
             "или сайт ограничил автоматический доступ."
         )
     except KrishaError as exc:
+        await database.fail_job(job_id, str(exc))
         logger.warning("Ошибка Krisha.kz для пользователя %s: %s", user_id, exc)
         await message.answer("❌ Ошибка при загрузке фотографий. Попробуй ещё раз позже.")
-    except Exception:
+    except Exception as exc:
+        await database.fail_job(job_id, str(exc))
         logger.exception("Необработанная ошибка для пользователя %s", user_id)
         await message.answer("❌ Произошла внутренняя ошибка. Попробуй ещё раз позже.")
     finally:

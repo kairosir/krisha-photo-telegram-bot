@@ -10,14 +10,19 @@ class WebhookDispatchTests(unittest.IsolatedAsyncioTestCase):
         update = object()
         dispatcher = AsyncMock()
         settings = object()
+        database = object()
 
-        with patch("app.get_settings", return_value=settings):
+        with (
+            patch("app.get_settings", return_value=settings),
+            patch("app._get_database", return_value=database),
+        ):
             await _dispatch_update(bot, dispatcher, update)  # type: ignore[arg-type]
 
         dispatcher.feed_update.assert_awaited_once_with(
             bot,
             update,
             settings=settings,
+            database=database,
         )
 
 

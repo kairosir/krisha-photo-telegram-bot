@@ -1,6 +1,7 @@
 .env*
 !.env.example
 .vercel/
+.neon
 .venv/
 venv/
 __pycache__/

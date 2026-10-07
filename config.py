@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     bot_token: SecretStr
     webhook_secret: SecretStr | None = None
+    database_url: SecretStr | None = None
     log_level: str = "INFO"
     http_timeout_seconds: float = Field(default=25.0, gt=0)
     http_retries: int = Field(default=3, ge=1, le=8)

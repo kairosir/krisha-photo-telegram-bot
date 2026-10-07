@@ -7,6 +7,7 @@ from aiogram.enums import ParseMode
 
 from config import get_settings
 from handlers import commands_router, listings_router
+from services.database import Database
 from utils.logging import configure_logging
 
 
@@ -22,12 +23,16 @@ async def main() -> None:
     dispatcher = Dispatcher()
     dispatcher.include_router(commands_router)
     dispatcher.include_router(listings_router)
+    database = Database(
+        settings.database_url.get_secret_value() if settings.database_url else None
+    )
 
     logger.info("Бот запущен")
     try:
         await bot.delete_webhook(drop_pending_updates=False)
-        await dispatcher.start_polling(bot, settings=settings)
+        await dispatcher.start_polling(bot, settings=settings, database=database)
     finally:
+        await database.close()
         await bot.session.close()
         logger.info("Бот остановлен")
 

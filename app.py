@@ -11,11 +11,13 @@ from fastapi import FastAPI, HTTPException, Request
 
 from config import get_settings
 from handlers import commands_router, listings_router
+from services.database import Database
 from utils.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 _bot: Bot | None = None
 _dispatcher: Dispatcher | None = None
+_database: Database | None = None
 
 
 def _components() -> tuple[Bot, Dispatcher]:
@@ -33,11 +35,23 @@ def _components() -> tuple[Bot, Dispatcher]:
     return _bot, _dispatcher
 
 
+def _get_database() -> Database:
+    global _database
+    if _database is None:
+        settings = get_settings()
+        _database = Database(
+            settings.database_url.get_secret_value() if settings.database_url else None
+        )
+    return _database
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
     if _bot is not None:
         await _bot.session.close()
+    if _database is not None:
+        await _database.close()
 
 
 app = FastAPI(title="Krisha Telegram Bot", lifespan=lifespan)
@@ -53,7 +67,12 @@ def _verify_secret(request: Request, header_name: str) -> str:
 
 
 async def _dispatch_update(bot: Bot, dispatcher: Dispatcher, update: Update) -> None:
-    await dispatcher.feed_update(bot, update, settings=get_settings())
+    await dispatcher.feed_update(
+        bot,
+        update,
+        settings=get_settings(),
+        database=_get_database(),
+    )
 
 
 @app.get("/")
