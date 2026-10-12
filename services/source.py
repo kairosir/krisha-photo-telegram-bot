@@ -209,7 +209,12 @@ async def _fetch_html_with_browser(url: str, settings: Settings) -> str:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            async with AsyncCamoufox(headless=True) as browser:
+            kwargs: dict[str, object] = {"headless": True}
+            if settings.camoufox_persistent_root:
+                # Постоянный профиль/фингерпринт: меньше повторных челленджей
+                # и нет генерации фингерпринта при каждом запросе (экономия CPU/RAM).
+                kwargs["persistent_root"] = settings.camoufox_persistent_root
+            async with AsyncCamoufox(**kwargs) as browser:
                 page = await browser.new_page()
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 try:

@@ -18,7 +18,8 @@ RUN pip install --upgrade pip && pip install -r requirements.txt \
 
 COPY . .
 
-RUN useradd --create-home --uid 10001 botuser && chown -R botuser:botuser /app
+RUN useradd --create-home --uid 10001 botuser && chown -R botuser:botuser /app \
+    && mkdir -p /data/camoufox && chown -R botuser:botuser /data
 USER botuser
 
 CMD ["python", "-m", "bot.main"]
