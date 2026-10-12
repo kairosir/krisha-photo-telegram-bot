@@ -23,7 +23,7 @@ class ImageProcessingError(RuntimeError):
 
 
 class ImageProcessor:
-    def __init__(self, semaphore: asyncio.Semaphore, inpaint_radius: float = 3.5) -> None:
+    def __init__(self, semaphore: asyncio.Semaphore, inpaint_radius: float = 4.0) -> None:
         self._semaphore = semaphore
         self._inpaint_radius = inpaint_radius
 
@@ -48,49 +48,52 @@ class ImageProcessor:
             )
 
     # ------------------------------------------------------------------
-    # Автоматическое обнаружение водяных знаков
+    # Автоматическое обнаружение водяных знаков (полнокадровое)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _contrast_map(gray: np.ndarray) -> np.ndarray:
-        """Пиксельный локальный контраст: |gray - blur(gray)|, нормализованный по шуму фона."""
-        sigma = max(3.0, min(gray.shape) / 80.0)
-        blur = cv2.GaussianBlur(gray, (0, 0), sigma)
-        return cv2.absdiff(gray, blur)
+    def _colorfulness(image: np.ndarray) -> np.ndarray:
+        """Карта «бесцветности» (0..255). Водяные знаки Krisha — белые/серые, у них
+        почти нет насыщения; цветной контент (трава, мебель, небо) получает высокий балл."""
+        b = image[:, :, 0].astype(np.int16)
+        g = image[:, :, 1].astype(np.int16)
+        r = image[:, :, 2].astype(np.int16)
+        maxc = np.maximum(np.maximum(r, g), b)
+        minc = np.minimum(np.minimum(r, g), b)
+        sat = (maxc - minc).astype(np.float32)
+        sat /= np.maximum(maxc.astype(np.float32), 1.0)
+        return np.clip(sat * 255.0, 0, 255).astype(np.uint8)
 
     @staticmethod
-    def _candidate_mask(gray: np.ndarray, contrast: np.ndarray) -> np.ndarray:
-        """Кандидаты на текст ватермарка: контраст к местному фону или экстремальная яркость."""
-        p50, p99 = np.percentile(contrast, [50.0, 99.0])
-        # Порог выше шума фона, но не выше реальных границ букв
-        thr = float(np.clip(max(p50 * 4.0, 12.0), 12.0, max(p99, 13.0)))
-
-        # Сигнатурный тест: пиксель выделяется относительно медианы своего локального
-        # окружения (а не относительно размытия). Это ловит полупрозрачные ватермарки
-        # и не реагирует на ровное небо/тени с JPEG-шумом.
-        ksize = int(min(gray.shape) * 0.06) | 1
-        local_med = cv2.medianBlur(gray, max(ksize, 7))
-        diff = gray.astype(np.int16) - local_med.astype(np.int16)
-        light_text = cv2.threshold(np.clip(diff, 0, 255).astype(np.uint8), 28, 255, cv2.THRESH_BINARY)[1]
-        dark_text = cv2.threshold(np.clip(-diff, 0, 255).astype(np.uint8), 28, 255, cv2.THRESH_BINARY)[1]
-
-        _, hi_contrast = cv2.threshold(contrast, thr, 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_or(cv2.bitwise_or(light_text, dark_text), hi_contrast)
-
-        # Экстремально яркие/тёмные пиксели — только если они чуть выделяются на фоне
-        mild_edge = cv2.threshold(contrast, max(thr * 0.35, 4.0), 255, cv2.THRESH_BINARY)[1]
-        _, bright = cv2.threshold(gray, 238, 255, cv2.THRESH_BINARY)
-        bright = cv2.bitwise_and(bright, mild_edge)
-        _, dark = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY_INV)
-        dark = cv2.bitwise_and(dark, mild_edge)
-        return cv2.bitwise_or(cv2.bitwise_or(mask, bright), dark)
+    def _multiscale_response(gray_f: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Отклики по гауссовым разностям на мелком (σ=1.5) и крупном (σ=24) масштабах.
+        Мелкий ловит тонкие штрихи букв, крупный — мягкие ореолы полупрозрачных
+        тайлинговых знаков; максимум по всем σ размывает границу между ними,
+        поэтому используется пара «узкий + широкий»."""
+        fine = np.abs(gray_f - cv2.GaussianBlur(gray_f, (0, 0), 1.5))
+        wide = np.abs(gray_f - cv2.GaussianBlur(gray_f, (0, 0), 24.0))
+        resp = np.maximum(fine, wide)
+        return resp, fine
 
     def _detect_watermarks(self, image: np.ndarray) -> np.ndarray:
-        """Возвращает точную маску только тех компонентов, что похожи на водяной знак."""
+        """Сканирует ВСЁ изображение целиком без привязки к зонам (углам/центру).
+        Возвращает маску пикселей, похожих на текстовый/логотипный водяной знак."""
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        contrast = self._contrast_map(gray)
-        candidates = self._candidate_mask(gray, contrast)
+        gray_f = gray.astype(np.float32)
+
+        resp, fine = self._multiscale_response(gray_f)
+
+        # Адаптивный порог относительно шума фона этого конкретного кадра.
+        # Считаем его по «тихой половине» кадра (ровные области), иначе кадр,
+        # густо покрытый тайлинговым знаком, поднял бы порог и знак бы пропал.
+        p50 = float(np.percentile(resp, 50.0))
+        thr = max(6.0, min(p50 * 4.0 + 1.5, 22.0))
+        candidates = (resp > thr).astype(np.uint8) * 255
+
+        # Хроматическая фильтрация: оставляем только achromatic (белый/серый) контент.
+        colorless = cv2.threshold(self._colorfulness(image), 45, 255, cv2.THRESH_BINARY_INV)[1]
+        candidates = cv2.bitwise_and(candidates, colorless)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         candidates = cv2.morphologyEx(candidates, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -100,54 +103,61 @@ class ImageProcessor:
             candidates, connectivity=8
         )
 
-        area_limit = 0.05 * width * height
-        min_side = max(4, int(min(width, height) * 0.006))
+        area_limit = 0.18 * width * height  # крупный логотип может занимать до ~18% кадра
+        min_side = max(3, int(min(width, height) * 0.004))
+        # Контраст символа: медиана мелкого отклика внутри компонента против
+        # медианы широкой окрестности. Коэффициент 1.3 оставляет реальные глифы
+        # (контраст знака к фону обычно ≥2) и отсекает мягкий ореол вокруг них,
+        # который при сильных знаках иначе порождает ложные срабатывания на шуме.
+        med_resp = cv2.medianBlur(resp.astype(np.uint8), 9).astype(np.float32)
         mask = np.zeros((height, width), dtype=np.uint8)
 
+        def local_bg(cx: float, cy: float) -> float:
+            x1, y1 = max(0, int(cx - 40)), max(0, int(cy - 40))
+            x2, y2 = min(width, int(cx + 40)), min(height, int(cy + 40))
+            return float(np.median(med_resp[y1:y2, x1:x2]))
+
         for i in range(1, num_labels):
-            x, y, w, h, area = stats[i]
-            if area < min_side * min_side or area > area_limit:
-                continue
-            if w < min_side or h < min_side:
+            _, _, w, h, area = stats[i]
+            if area < min_side * min_side or w < min_side or h < min_side:
                 continue
             component = labels == i
-            # Символ должен заметно выделяться на ЛОКАЛЬНОМ фоне. Сила контраста —
-            # сумма двух независимых признаков: отклонение от медианы окружения и
-            # отклонение от гладкого (Гауссова) фона. Оба устойчивы к JPEG-шуму
-            # ровных областей (небо, стены), поэтому фото без текста не трогается.
+            comp_med = float(np.median(fine[component]))
             cx, cy = centroids[i]
-            center_zone = abs(cx / width - 0.5) < 0.35 and abs(cy / height - 0.5) < 0.3
-            corner_zone = (cx < 0.3 * width or cx > 0.7 * width) and (
-                cy < 0.25 * height or cy > 0.75 * height
-            )
-            bottom_zone = cy > 0.8 * height
-            if not (center_zone or corner_zone or bottom_zone):
+            if comp_med < max(local_bg(cx, cy) * 1.3, thr * 0.6):
+                continue
+            # Форма символа/строки: разумное соотношение сторон
+            aspect = max(w, h) / max(1, min(w, h))
+            if aspect > 40:
+                continue
+            # Сверхкрупные компоненты — почти всегда сам кадр (границы зон,
+            # большие ровные области); настоящий знак такого размера не бывает.
+            if area > area_limit:
                 continue
             mask[component] = 255
 
         if not mask.any():
             return mask
 
-        # Соединяем соседние символы строки в единые компоненты и отбрасываем одиночный мусор
-        connect = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+        # Группировка соседних символов в строки/логотипы и отсев одиночного мусора
+        connect = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
         grouped = cv2.dilate(mask, connect, iterations=1)
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
         final = np.zeros_like(mask)
-        min_group_area = max(80, int(0.00008 * width * height))
+        min_group_area = max(60, int(0.00005 * width * height))
         for i in range(1, num_labels):
             if stats[i, cv2.CC_STAT_AREA] >= min_group_area:
-                component = labels == i
-                final[component & (mask > 0)] = 255
+                final[(labels == i) & (mask > 0)] = 255
+        if not final.any():
+            return final
 
-        # Расширяем до реальных границ штриха (антиалиасинг букв) — порог привязан
-        # к адаптивному порогу кандидатов, а не к фиксированной константе.
-        p50 = float(np.percentile(contrast, 50.0))
-        stroke_thr = max(6.0, min(p50 * 1.5, 24.0))
-        stroke = cv2.threshold(contrast, stroke_thr, 255, cv2.THRESH_BINARY)[1]
-        grown = cv2.dilate(final, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
-        final = cv2.bitwise_and(stroke, grown)
-        # Гарантируем, что ядро самого символа всегда попадает в маску
-        final = cv2.bitwise_or(cv2.dilate(final, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))), mask)
+        # Дорастить до реальных границ штриха (антиалиасинг букв) и добавить
+        # небольшой буфер, чтобы TELEA полностью закрыл ореол вокруг глифов.
+        stroke_thr = max(4.0, thr * 0.45)
+        stroke = (resp > stroke_thr).astype(np.uint8) * 255
+        grown = cv2.dilate(final, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
+        final = cv2.bitwise_or(cv2.bitwise_and(stroke, grown), final)
+        final = cv2.dilate(final, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
         return final
 
     # ------------------------------------------------------------------
@@ -234,10 +244,7 @@ class ImageProcessor:
 
         if auto_remove_watermark:
             detected = self._detect_watermarks(image)
-            if mask.any():
-                mask = cv2.bitwise_or(mask, detected)
-            else:
-                mask = detected
+            mask = cv2.bitwise_or(mask, detected)
 
         if not mask.any():
             # Ничего не нашли — переупаковываем без потерь качества вместо битого JPEG-перекодирования
@@ -245,5 +252,36 @@ class ImageProcessor:
             return destination
 
         result = cv2.inpaint(image, mask, self._inpaint_radius, cv2.INPAINT_TELEA)
+
+        # Итеративные проходы: остаточный ореол знака остаётся ВДОЛЬ уже
+        # вычищенных границ (после TELEA контраст фона падает и детектор с
+        # адаптивным порогом начинает ловить обычный шум по всему кадру).
+        # Поэтому дорабатываем не глобальным детектором, а локальным порогом
+        # строго в окрестности удалённых областей.
+        band_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        outer_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        for _ in range(2):
+            band = cv2.bitwise_and(
+                cv2.dilate(mask, band_kernel),
+                cv2.bitwise_not(cv2.dilate(mask, outer_kernel)),
+            )
+            if not band.any():
+                break
+            gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+            resp, _ = self._multiscale_response(gray.astype(np.float32))
+            colorless = cv2.threshold(self._colorfulness(result), 45, 255, cv2.THRESH_BINARY_INV)[1]
+            outside = cv2.bitwise_not(cv2.dilate(mask, outer_kernel))
+            ref = float(np.percentile(resp[outside > 0], 90.0)) if np.any(outside) else 12.0
+            residual = ((resp > max(ref * 1.6, 8.0)) & (colorless > 0)).astype(np.uint8) * 255
+            residual = cv2.morphologyEx(
+                residual, cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1,
+            )
+            residual = cv2.bitwise_and(residual, band)
+            if not residual.any():
+                break
+            result = cv2.inpaint(result, residual, self._inpaint_radius, cv2.INPAINT_TELEA)
+            mask = cv2.bitwise_or(mask, residual)
+
         self._save_result(result, alpha, destination, jpeg_quality=95)
         return destination
