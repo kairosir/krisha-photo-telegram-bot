@@ -10,3 +10,5 @@ python-dotenv>=1.0,<2
 fastapi>=0.115,<1
 asyncpg>=0.30,<1
 camoufox[geoip]>=0.4,<1
+# CPU-only сборка PyTorch для модели LaMa (инпейнт водяных знаков)
+torch>=2.3,<3 --extra-index-url https://download.pytorch.org/whl/cpu
