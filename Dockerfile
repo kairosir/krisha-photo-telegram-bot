@@ -6,9 +6,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Имена пакетов различаются между Debian bookworm и trixie (t64-суффикс),
+# поэтому ставим все известные варианты; отсутствующие игнорируются.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libglib2.0-0 libgl1 \
-       libgtk-3-0 libdbus-glib-1-0 libasound2 \
+    && for pkg in libglib2.0-0 libgl1 libdbus-glib-1-2 \
+       libgtk-3-0 libgtk-3-0t64 \
+       libdbus-glib-1-0 libdbus-glib-1-0t64 \
+       libasound2 libasound2t64; do \
+         apt-get install -y --no-install-recommends "$pkg" 2>/dev/null || true; \
+       done \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -18,7 +24,8 @@ RUN pip install --upgrade pip && pip install -r requirements.txt \
 
 COPY . .
 
-RUN useradd --create-home --uid 10001 botuser && chown -R botuser:botuser /app
+RUN useradd --create-home --uid 10001 botuser && chown -R botuser:botuser /app \
+    && mkdir -p /data/camoufox && chown -R botuser:botuser /data
 USER botuser
 
 CMD ["python", "-m", "bot.main"]
