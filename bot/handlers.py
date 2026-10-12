@@ -100,7 +100,11 @@ async def _process_listing(message: Message, bot: Bot, settings: Settings, url: 
                 raise ListingUnavailableError("Не удалось скачать подходящие фотографии")
 
             await message.answer(f"📸 Найдено фотографий: {len(originals)}\n⏳ Обрабатываю…")
-            processor = ImageProcessor(_get_processing_semaphore(settings.global_processing_limit))
+            processor = ImageProcessor(
+                _get_processing_semaphore(settings.global_processing_limit),
+                use_lama=settings.use_lama,
+                lama_model_dir=settings.lama_model_dir,
+            )
 
             async def process_one(index: int, image: DownloadedImage) -> Path:
                 output = processed_dir / f"processed_{index:03d}{image.path.suffix.lower()}"
