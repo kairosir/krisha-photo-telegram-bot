@@ -8,10 +8,13 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libglib2.0-0 libgl1 \
+       libgtk-3-0 libdbus-glib-1-0 libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt \
+    && python -m playwright install firefox \
+    && python -m camoufox fetch
 
 COPY . .
 

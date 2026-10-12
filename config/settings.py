@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     http_timeout_seconds: float = Field(default=25.0, gt=0)
     http_retries: int = Field(default=3, ge=1, le=8)
+    browser_timeout_seconds: float = Field(default=60.0, gt=0)
     max_page_bytes: int = Field(default=5 * 1024 * 1024, ge=1024)
     max_image_bytes: int = Field(default=25 * 1024 * 1024, ge=1024)
     max_images_per_listing: int = Field(default=50, ge=1, le=100)

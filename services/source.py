@@ -21,6 +21,16 @@ IMAGE_KEYS = {
 }
 DROP_QUERY_KEYS = {"w", "h", "width", "height", "resize", "quality", "q", "thumbnail"}
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+STATIC_PATH_MARKERS = ("/static/", "/favicons/", "/favicon")
+PROMO_PATH_MARKERS = ("main_960", "-----0")
+THUMBNAIL_SIZE_RE = re.compile(r"-\d{2,4}x\d{2,4}(?=\.\w{3,4}$|[?#])")
+FULL_SIZE_SUFFIX_RE = re.compile(
+    r"/(?P<stem>[^/?#]+?)-\d{2,4}x\d{2,4}(?P<ext>\.(?:jpe?g|png|webp|avif))(?P<tail>[?#]|$)",
+    re.IGNORECASE,
+)
+PHOTO_GALLERY_JSON_RE = re.compile(
+    r'"photos"\s*:\s*\[(?P<body>(?:\{[^{}]*\},?\s*)*)\]'
+)
 
 
 class SourceError(RuntimeError):
@@ -33,6 +43,24 @@ class ListingUnavailableError(SourceError):
 
 class AccessRestrictedError(SourceError):
     pass
+
+
+def _canonicalize_image_url(value: str) -> str:
+    """Приводит URL миниатюры Krisha к полному размеру: .../12-750x470.jpg -> .../12-full.jpg."""
+    return FULL_SIZE_SUFFIX_RE.sub(lambda m: f"/{m.group('stem')}-full{m.group('ext')}{m.group('tail')}", value)
+
+
+def _extract_gallery_photos(html: str) -> list[str]:
+    """Достаёт точный список фото галереи из инлайнового JSON страницы объявления."""
+    match = PHOTO_GALLERY_JSON_RE.search(html)
+    if not match:
+        return []
+    urls: list[str] = []
+    for item in re.finditer(r'\{\s*"src"\s*:\s*"(?P<src>[^"]+)"', match.group("body")):
+        src = item.group("src").replace("\\/", "/").strip()
+        if src and _looks_like_image_url(src):
+            urls.append(src)
+    return urls
 
 
 def _looks_like_image_url(value: str) -> bool:
@@ -119,12 +147,21 @@ def extract_image_urls(html: str, page_url: str) -> list[str]:
         parsed = urlparse(urljoin(page_url, clean))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             continue
+        path_lower = parsed.path.lower()
+        # отбрасываем иконки/логотипы сайта и рекламные баннеры — это не фото объявления
+        if any(marker in path_lower for marker in STATIC_PATH_MARKERS + PROMO_PATH_MARKERS):
+            continue
         query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in DROP_QUERY_KEYS]
         canonical = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(query), ""))
-        key = canonical.lower()
-        if _looks_like_image_url(canonical) and key not in seen:
+        if THUMBNAIL_SIZE_RE.search(canonical):
+            # миниатюры (120x90, 750x470...) берём в полном размере; если такой версии нет — скачаем как есть
+            candidate = _canonicalize_image_url(canonical)
+        else:
+            candidate = canonical
+        key = candidate.lower()
+        if _looks_like_image_url(candidate) and key not in seen:
             seen.add(key)
-            result.append(canonical)
+            result.append(candidate)
     return result
 
 
@@ -150,21 +187,75 @@ class RetryingHttpClient:
         raise SourceError(f"HTTP-запрос не удался: {last_error}") from last_error
 
 
+SAFE_LINE_STATUSES = {468, 429}
+
+
+def _is_challenge_html(html: str) -> bool:
+    lowered = html.lower()
+    return "safeline" in lowered or ".safeline/challenge" in lowered
+
+
+async def _fetch_html_with_browser(url: str, settings: Settings) -> str:
+    """Рендеринг страницы в реальном браузере для обхода JS-защиты SafeLine."""
+    try:
+        from camoufox.async_api import AsyncCamoufox
+    except ImportError as exc:
+        raise AccessRestrictedError(
+            "Krisha.kz включил антибот-проверку. Для обхода установите зависимость: "
+            'pip install "camoufox[geoip]" && python -m camoufox fetch'
+        ) from exc
+
+    timeout_ms = int(settings.browser_timeout_seconds * 1000)
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with AsyncCamoufox(headless=True) as browser:
+                page = await browser.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_selector(
+                        ".listing-photo-full, img[src*='krisha']", timeout=timeout_ms // 2
+                    )
+                except Exception:
+                    pass  # пробуем разобрать то, что загрузилось
+                html = await page.content()
+                if _is_challenge_html(html):
+                    raise SourceError("Браузер так и не прошёл антибот-проверку")
+                return html
+        except Exception as exc:  # noqa: BLE001 - повтор с новой сессией/фингерпринтом
+            last_error = exc
+            await asyncio.sleep(1 + attempt)
+    raise AccessRestrictedError(f"Не удалось получить страницу через браузер: {last_error}")
+
+
 class ListingSource:
     def __init__(self, http: RetryingHttpClient, settings: Settings) -> None:
         self._http = http
         self._settings = settings
 
+    @staticmethod
+    def _pick_urls(html: str, page_url: str) -> list[str]:
+        """Сначала точный JSON галереи; DOM/regex-извлечение — только как запасной вариант."""
+        gallery = [_canonicalize_image_url(u) for u in _extract_gallery_photos(html)]
+        if gallery:
+            return list(dict.fromkeys(gallery))
+        return extract_image_urls(html, page_url)
+
     async def get_image_urls(self, listing_url: str) -> list[str]:
         validated = validate_listing_url(listing_url)
         if validated is None:
             raise ListingUnavailableError("Некорректный URL объявления")
+
         response = await self._http.request(validated)
         async with response:
-            if response.status in {401, 403, 429}:
-                raise AccessRestrictedError(f"Сайт вернул HTTP {response.status}")
             if response.status == 404:
                 raise ListingUnavailableError("Объявление не найдено")
+            if response.status in SAFE_LINE_STATUSES:
+                # SafeLine (антибот Krisha) отдаёт JS-челлендж — добираемся через браузер
+                html = await _fetch_html_with_browser(validated, self._settings)
+                return self._pick_urls(html, validated)[: self._settings.max_images_per_listing]
+            if response.status in {401, 403}:
+                raise AccessRestrictedError(f"Сайт вернул HTTP {response.status}")
             if response.status >= 400:
                 raise SourceError(f"Krisha.kz вернул HTTP {response.status}")
             content_type = response.headers.get("Content-Type", "").lower()
@@ -176,4 +267,13 @@ class ListingSource:
             if len(body) > self._settings.max_page_bytes:
                 raise ListingUnavailableError("Страница объявления слишком велика")
             html = body.decode(response.charset or "utf-8", errors="replace")
-        return extract_image_urls(html, str(response.url))[: self._settings.max_images_per_listing]
+
+        if _is_challenge_html(html):
+            html = await _fetch_html_with_browser(validated, self._settings)
+
+        urls = self._pick_urls(html, validated)
+        if not urls:
+            # страница могла вернуться без челленджа, но с нерендеренными данными — пробуем браузер
+            html = await _fetch_html_with_browser(validated, self._settings)
+            urls = self._pick_urls(html, validated)
+        return urls[: self._settings.max_images_per_listing]
