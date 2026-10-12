@@ -1,5 +1,8 @@
 import asyncio
+import logging
 import shutil
+import threading
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -7,6 +10,17 @@ from typing import Sequence
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+
+logger = logging.getLogger(__name__)
+
+LAMA_MODEL_URLS = (
+    "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt",
+    "https://huggingface.co/cocktailpeanut/biglama/resolve/main/big-lama.pt",
+)
+LAMA_FILENAME = "big-lama.pt"
+# Максимальный размер большей стороны кадра при нейро-инпейнте: LaMa обучена
+# на ~512-768px; крупные кадры режутся на тайлы с перекрытием.
+LAMA_TILE = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +36,144 @@ class ImageProcessingError(RuntimeError):
     pass
 
 
+class _LamaEngine:
+    """Ленивая singleton-обёртка над TorchScript-моделью LaMa (MIT лицензия).
+
+    Модель скачивается один раз (~200 МБ) и держится в памяти. Инференс
+    защищён lock'ом: torch сам по себе потокобезопасен только для eval,
+    но память ограничена, поэтому параллелим не больше OMP threads.
+    """
+
+    _lock = threading.Lock()
+    _model = None
+    _device = None
+
+    @classmethod
+    def available(cls) -> bool:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @classmethod
+    def _ensure_model(cls, model_dir: str | None):
+        if cls._model is not None:
+            return cls._model
+        with cls._lock:
+            if cls._model is not None:
+                return cls._model
+            import torch
+
+            path = cls._locate_weights(model_dir)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = torch.jit.load(str(path), map_location=device)
+            model.eval()
+            cls._model = model
+            cls._device = device
+            logger.info("LaMa загружена на %s (веса: %s)", device, path)
+            return cls._model
+
+    @staticmethod
+    def _locate_weights(model_dir: str | None) -> Path:
+        candidates: list[Path] = []
+        if model_dir:
+            candidates.append(Path(model_dir) / LAMA_FILENAME)
+        env_dir = Path(__file__).resolve().parent.parent / "models"
+        candidates.append(env_dir / LAMA_FILENAME)
+        candidates.append(Path.home() / ".cache" / "krisha-bot" / LAMA_FILENAME)
+        for c in candidates:
+            if c.is_file():
+                return c
+
+        target = candidates[-1]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        last_error: Exception | None = None
+        for url in LAMA_MODEL_URLS:
+            try:
+                logger.info("Скачиваю модель LaMa: %s", url)
+                tmp = target.with_suffix(".part")
+                urllib.request.urlretrieve(url, tmp)
+                tmp.rename(target)
+                return target
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("Не удалось скачать LaMa с %s: %s", url, exc)
+        raise ImageProcessingError(
+            f"Модель LaMa не найдена и не скачалась: {last_error}"
+        )
+
+    @classmethod
+    def inpaint(cls, image_bgr: np.ndarray, mask: np.ndarray, model_dir: str | None) -> np.ndarray:
+        """Инпейнт всего кадра. Большие фото режутся на тайлы LAMA_TILE с
+        перекрытием 128px; результат склеивается линейным blending."""
+        import torch
+
+        model = cls._ensure_model(model_dir)
+        device = cls._device
+        height, width = image_bgr.shape[:2]
+
+        img_f = image_bgr.astype(np.float32) / 255.0
+        mask_bin = (mask > 127).astype(np.float32)
+        result = img_f.copy()
+
+        step = LAMA_TILE - 128
+        tiles_x = max(1, -(-width // step)) if width > LAMA_TILE else 1
+        tiles_y = max(1, -(-height // step)) if height > LAMA_TILE else 1
+        if width <= LAMA_TILE and height <= LAMA_TILE:
+            tiles = [(0, 0, width, height)]
+        else:
+            tiles = []
+            for ty in range(tiles_y):
+                for tx in range(tiles_x):
+                    x1 = min(tx * step, max(0, width - LAMA_TILE))
+                    y1 = min(ty * step, max(0, height - LAMA_TILE))
+                    tiles.append((x1, y1, min(x1 + LAMA_TILE, width), min(y1 + LAMA_TILE, height)))
+
+        pad = 8
+        for (x1, y1, x2, y2) in tiles:
+            tile_img = img_f[y1:y2, x1:x2]
+            tile_mask = mask_bin[y1:y2, x1:x2]
+            if tile_mask.max() < 0.5:
+                continue
+            th, tw = tile_img.shape[:2]
+            padded = np.zeros((th + 2 * pad, tw + 2 * pad, 3), np.float32)
+            padded[pad:pad + th, pad:pad + tw] = tile_img
+            pmask = np.zeros((th + 2 * pad, tw + 2 * pad), np.float32)
+            pmask[pad:pad + th, pad:pad + tw] = tile_mask
+            # Выровнять по 16 для сверточных слоёв модели
+            ph, pw = pmask.shape
+            nh, nw = ((ph + 15) // 16) * 16, ((pw + 15) // 16) * 16
+            canvas = np.zeros((nh, nw, 3), np.float32)
+            canvas[:ph, :pw] = padded
+            mcanvas = np.zeros((nh, nw), np.float32)
+            mcanvas[:ph, :pw] = pmask
+
+            xt = torch.from_numpy(canvas.transpose(2, 0, 1)[None]).to(device)
+            mt = torch.from_numpy(mcanvas[None, None]).to(device)
+            with torch.no_grad(), cls._lock:
+                out = model(xt, mt)[0].permute(1, 2, 0).clamp_(0, 1).float().cpu().numpy()
+            out = out[:ph, :pw, :]
+            filled = out[pad:pad + th, pad:pad + tw]
+            # Берём из нейросети только область маски с мягким переходом
+            blend = cv2.GaussianBlur(tile_mask, (0, 0), 3.0)[..., None]
+            result[y1:y2, x1:x2] = tile_img * (1 - blend) + filled * blend
+
+        return (result * 255.0).clip(0, 255).astype(np.uint8)
+
+
 class ImageProcessor:
-    def __init__(self, semaphore: asyncio.Semaphore, inpaint_radius: float = 4.0) -> None:
+    def __init__(
+        self,
+        semaphore: asyncio.Semaphore,
+        inpaint_radius: float = 4.0,
+        use_lama: bool = True,
+        lama_model_dir: str | None = None,
+    ) -> None:
         self._semaphore = semaphore
         self._inpaint_radius = inpaint_radius
+        self._use_lama = use_lama and _LamaEngine.available()
+        self._lama_model_dir = lama_model_dir
 
     async def process(
         self,
@@ -85,8 +233,6 @@ class ImageProcessor:
         resp, fine = self._multiscale_response(gray_f)
 
         # Адаптивный порог относительно шума фона этого конкретного кадра.
-        # Считаем его по «тихой половине» кадра (ровные области), иначе кадр,
-        # густо покрытый тайлинговым знаком, поднял бы порог и знак бы пропал.
         p50 = float(np.percentile(resp, 50.0))
         thr = max(6.0, min(p50 * 4.0 + 1.5, 22.0))
         candidates = (resp > thr).astype(np.uint8) * 255
@@ -105,10 +251,6 @@ class ImageProcessor:
 
         area_limit = 0.18 * width * height  # крупный логотип может занимать до ~18% кадра
         min_side = max(3, int(min(width, height) * 0.004))
-        # Контраст символа: медиана мелкого отклика внутри компонента против
-        # медианы широкой окрестности. Коэффициент 1.3 оставляет реальные глифы
-        # (контраст знака к фону обычно ≥2) и отсекает мягкий ореол вокруг них,
-        # который при сильных знаках иначе порождает ложные срабатывания на шуме.
         med_resp = cv2.medianBlur(resp.astype(np.uint8), 9).astype(np.float32)
         mask = np.zeros((height, width), dtype=np.uint8)
 
@@ -136,6 +278,19 @@ class ImageProcessor:
                 continue
             mask[component] = 255
 
+        # --- Групповой проход для тайлинговых знаков -------------------------
+        # Полупрозрачные знаки, набросанные сеткой по всему кадру, дают много
+        # мелких компонентов; одиночный глиф ниже min_group_area отбрасывался
+        # как шум и такие кадры оставались необработанными. Если похожих на
+        # символы компонентов много и они распределены по разным регионам
+        # кадра регулярно — это паттерн тайлинга: строим кластерные bbox
+        # (каждый повтор знака) и заполняем их всей мягкой зоной знака,
+        # включая ореол, который точечная маска глифов не захватывает.
+        tiling_boxes = self._tiling_boxes(labels, stats, centroids, width, height)
+        if tiling_boxes is not None:
+            for x, y, bw, bh in tiling_boxes:
+                mask[y:y + bh, x:x + bw] = 255
+
         if not mask.any():
             return mask
 
@@ -151,14 +306,107 @@ class ImageProcessor:
         if not final.any():
             return final
 
-        # Дорастить до реальных границ штриха (антиалиасинг букв) и добавить
-        # небольшой буфер, чтобы TELEA полностью закрыл ореол вокруг глифов.
-        stroke_thr = max(4.0, thr * 0.45)
+        # Дорастить до реальных границ штриха (антиалиасинг букв). Порог берём
+        # ОТНОСИТЕЛЬНО контраста самих найденных глифов: абсолютный порог
+        # либо не дотягивает до мягких краёв полупрозрачного знака, либо ловит
+        # шум фона. Ограничиваем доращивание окрестностью маски + ореол.
+        comp_med = float(np.median(resp[mask > 0]))
+        stroke_thr = max(thr * 0.45, comp_med * 0.3)
         stroke = (resp > stroke_thr).astype(np.uint8) * 255
         grown = cv2.dilate(final, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
         final = cv2.bitwise_or(cv2.bitwise_and(stroke, grown), final)
         final = cv2.dilate(final, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
         return final
+
+    @staticmethod
+    def _tiling_boxes(
+        labels: np.ndarray,
+        stats: np.ndarray,
+        centroids: np.ndarray,
+        width: int,
+        height: int,
+    ) -> list[tuple[int, int, int, int]] | None:
+        """Обнаруживает регулярную сетку одинаковых символьных компонентов
+        (тайлинговый водяной знак) и возвращает bbox каждого повтора со
+        смягчёнными краями. None — если паттерн тайлинга не подтверждён."""
+        n = labels.max()
+        if n < 12:
+            return None
+        min_side = max(3, int(min(width, height) * 0.004))
+        cand_ids = []
+        for i in range(1, n + 1):
+            _, _, w, h, area = stats[i]
+            if area < min_side * min_side or area > 0.02 * width * height:
+                continue
+            if w < min_side or h < min_side or max(w, h) / max(1, min(w, h)) > 40:
+                continue
+            cand_ids.append(i)
+        if len(cand_ids) < 12:
+            return None
+
+        pts = centroids[cand_ids]
+        # Разбиваем кадр на 4x4 региона: тайлинг даёт компоненты по всей площади
+        regions: set[tuple[int, int]] = set()
+        for cx, cy in pts:
+            regions.add((min(3, int(cx / width * 4)), min(3, int(cy / height * 4))))
+        if len(regions) < 6:
+            return None
+
+        areas = np.array([stats[i, cv2.CC_STAT_AREA] for i in cand_ids], dtype=np.float64)
+        med_a = float(np.median(areas))
+        if med_a <= 0:
+            return None
+        consistent = [i for i in cand_ids if abs(stats[i, cv2.CC_STAT_AREA] - med_a) < med_a * 0.75]
+        if len(consistent) < 12:
+            return None
+
+        # Кластеризация центров повторами знака (eps ≈ медианный шаг сетки)
+        pts_c = centroids[consistent]
+        sizes = np.array([stats[i, cv2.CC_STAT_WIDTH] for i in consistent], dtype=np.float64)
+        med_w = float(np.median(sizes)) if len(sizes) else 20.0
+        eps = max(med_w * 2.5, min(width, height) * 0.05)
+
+        assigned = np.full(len(consistent), -1, dtype=int)
+        clusters: list[list[int]] = []
+        for idx in range(len(consistent)):
+            if assigned[idx] >= 0:
+                continue
+            cid = len(clusters)
+            stack = [idx]
+            assigned[idx] = cid
+            members: list[int] = []
+            while stack:
+                j = stack.pop()
+                members.append(j)
+                near = np.where(
+                    (np.abs(pts_c[:, 0] - pts_c[j, 0]) < eps)
+                    & (np.abs(pts_c[:, 1] - pts_c[j, 1]) < eps * 0.8)
+                    & (assigned < 0)
+                )[0]
+                for k in near:
+                    assigned[k] = cid
+                    stack.append(int(k))
+            clusters.append(members)
+
+        boxes: list[tuple[int, int, int, int]] = []
+        big_enough = [c for c in clusters if len(c) >= 4]
+        if len(big_enough) < 3:
+            return None
+        pad_x = max(8, int(med_w * 0.9))
+        pad_y = max(10, int(height * 0.02))
+        for members in big_enough:
+            xs = pts_c[members, 0]
+            ys = pts_c[members, 1]
+            x1 = max(0, int(xs.min() - pad_x))
+            y1 = max(0, int(ys.min() - pad_y))
+            x2 = min(width, int(xs.max() + pad_x))
+            y2 = min(height, int(ys.max() + pad_y))
+            bw, bh = x2 - x1, y2 - y1
+            # Повтор знака не должен быть больше ~35% кадра по каждой оси
+            if bw > 0.35 * width or bh > 0.35 * height:
+                continue
+            boxes.append((x1, y1, bw, bh))
+        return boxes or None
 
     # ------------------------------------------------------------------
     # Основной конвейер обработки
@@ -193,20 +441,31 @@ class ImageProcessor:
         destination: Path,
         jpeg_quality: int,
     ) -> None:
+        # Сохраняем через Pillow: у cv2.imwrite свои дефолтные уровни качества,
+        # из-за которых даже «пустая» обработка заметно портила бы JPEG.
         if alpha is not None:
             rgba = cv2.cvtColor(result, cv2.COLOR_BGR2RGBA)
             rgba[:, :, 3] = alpha
-            if not cv2.imwrite(str(destination.with_suffix(".png")), rgba, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
-                raise ImageProcessingError(f"Не удалось сохранить изображение: {destination.name}")
+            pil = Image.fromarray(rgba, mode="RGBA")
+            try:
+                pil.save(destination.with_suffix(".png"), optimize=False, compress_level=3)
+            except Exception as exc:
+                raise ImageProcessingError(f"Не удалось сохранить изображение: {destination.name}") from exc
             return
+        rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb, mode="RGB")
         suffix = destination.suffix.lower()
-        params: list[int] = []
-        if suffix in {".jpg", ".jpeg"}:
-            params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
-        elif suffix == ".png":
-            params = [cv2.IMWRITE_PNG_COMPRESSION, 3]
-        if not cv2.imwrite(str(destination), result, params):
-            raise ImageProcessingError(f"Не удалось сохранить изображение: {destination.name}")
+        try:
+            if suffix in {".jpg", ".jpeg"}:
+                pil.save(destination, quality=jpeg_quality, subsampling=0)
+            elif suffix == ".png":
+                pil.save(destination, optimize=False, compress_level=3)
+            elif suffix == ".webp":
+                pil.save(destination, quality=jpeg_quality, method=4)
+            else:
+                pil.save(destination)
+        except Exception as exc:
+            raise ImageProcessingError(f"Не удалось сохранить изображение: {destination.name}") from exc
 
     def _process_sync(
         self,
@@ -251,16 +510,26 @@ class ImageProcessor:
             shutil.copy2(source, destination)
             return destination
 
-        result = cv2.inpaint(image, mask, self._inpaint_radius, cv2.INPAINT_TELEA)
+        # Расширяем маску: полупрозрачные знаки имеют мягкие края, которые
+        # детектор захватывает не полностью; без буфера LaMa оставит ореол.
+        work_mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
 
-        # Итеративные проходы: остаточный ореол знака остаётся ВДОЛЬ уже
-        # вычищенных границ (после TELEA контраст фона падает и детектор с
-        # адаптивным порогом начинает ловить обычный шум по всему кадру).
-        # Поэтому дорабатываем не глобальным детектором, а локальным порогом
-        # строго в окрестности удалённых областей.
+        result = None
+        if self._use_lama:
+            try:
+                result = _LamaEngine.inpaint(image, work_mask, self._lama_model_dir)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LaMa недоступна (%s), откат на OpenCV TELEA", exc)
+                self._use_lama = False
+        if result is None:
+            result = cv2.inpaint(image, work_mask, self._inpaint_radius, cv2.INPAINT_TELEA)
+
+        # Итеративная доработка остатков (полезна в обоих режимах: у LaMa тоже
+        # бывают пропуски на самых плотных тайлинговых знаках).
         band_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         outer_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-        for _ in range(2):
+        passes = 1 if self._use_lama else 2
+        for _ in range(passes):
             band = cv2.bitwise_and(
                 cv2.dilate(mask, band_kernel),
                 cv2.bitwise_not(cv2.dilate(mask, outer_kernel)),
@@ -280,7 +549,13 @@ class ImageProcessor:
             residual = cv2.bitwise_and(residual, band)
             if not residual.any():
                 break
-            result = cv2.inpaint(result, residual, self._inpaint_radius, cv2.INPAINT_TELEA)
+            if self._use_lama:
+                try:
+                    result = _LamaEngine.inpaint(result, residual, self._lama_model_dir)
+                except Exception:  # noqa: BLE001
+                    result = cv2.inpaint(result, residual, self._inpaint_radius, cv2.INPAINT_TELEA)
+            else:
+                result = cv2.inpaint(result, residual, self._inpaint_radius, cv2.INPAINT_TELEA)
             mask = cv2.bitwise_or(mask, residual)
 
         self._save_result(result, alpha, destination, jpeg_quality=95)
