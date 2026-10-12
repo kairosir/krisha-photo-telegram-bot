@@ -18,3 +18,4 @@ temp/output/*
 work/
 outputs/
 *.log
+big-lama.pt
