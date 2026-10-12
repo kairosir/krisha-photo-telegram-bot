@@ -54,6 +54,16 @@ async def _dispatch_update(bot: Bot, dispatcher: Dispatcher, update: Update) -> 
     )
 
 
+# Фоновые задачи (обработка объявлений) не должны собираться GC до завершения
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_dispatch(bot: Bot, dispatcher: Dispatcher, update: Update) -> None:
+    task = asyncio.create_task(_dispatch_update(bot, dispatcher, update))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
@@ -87,12 +97,15 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         payload = await request.json()
         bot, dispatcher = _components()
         update = Update.model_validate(payload, context={"bot": bot})
-        await _dispatch_update(bot, dispatcher, update)
     except HTTPException:
         raise
     except Exception:
-        logger.exception("Ошибка обработки Telegram webhook")
-        raise HTTPException(status_code=500, detail="Webhook processing failed")
+        logger.exception("Ошибка разбора Telegram webhook")
+        raise HTTPException(status_code=400, detail="Bad update payload")
+    # Обработка запускается фоном, чтобы ответ Telegram ушёл мгновенно:
+    # иначе длинные задачи (скачивание + inpainting) вызывают таймауты
+    # и повторную доставку апдейта.
+    _spawn_dispatch(bot, dispatcher, update)
     return {"ok": True}
 
 

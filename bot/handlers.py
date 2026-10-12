@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import shutil
 from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
@@ -11,7 +13,7 @@ from bot import messages
 from bot.keyboards import commands_keyboard
 from config import Settings
 from services.database import Database
-from services.downloader import ImageDownloader
+from services.downloader import DownloadedImage, ImageDownloader
 from services.image_processor import ImageProcessor
 from services.source import (
     AccessRestrictedError,
@@ -26,6 +28,10 @@ from utils.validators import validate_listing_url
 
 router = Router(name="bot")
 logger = logging.getLogger(__name__)
+
+
+class TelegramDeliveryError(RuntimeError):
+    pass
 
 _active_tasks: dict[int, asyncio.Task[object]] = {}
 _tasks_guard = asyncio.Lock()
@@ -95,22 +101,42 @@ async def _process_listing(message: Message, bot: Bot, settings: Settings, url: 
 
             await message.answer(f"📸 Найдено фотографий: {len(originals)}\n⏳ Обрабатываю…")
             processor = ImageProcessor(_get_processing_semaphore(settings.global_processing_limit))
-            processed: list[Path] = []
-            for index, image in enumerate(originals, start=1):
-                output = processed_dir / f"processed_{index:03d}{image.path.suffix.lower()}"
-                processed.append(await processor.process(image.path, output))
 
-            await send_photos(bot, message.chat.id, processed)
+            async def process_one(index: int, image: DownloadedImage) -> Path:
+                output = processed_dir / f"processed_{index:03d}{image.path.suffix.lower()}"
+                try:
+                    return await processor.process(image.path, output)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # деградация: отдаём оригинал вместо падения всей задачи
+                    logger.warning("Обработка %s не удалась (%s), отправляю оригинал", image.path.name, exc)
+                    shutil.copy2(image.path, output)
+                    return output
+
+            processed = list(
+                await asyncio.gather(
+                    *(process_one(i, img) for i, img in enumerate(originals, start=1))
+                )
+            )
+
+            sent_photos = await send_photos(bot, message.chat.id, processed)
+            originals_sent = 0
             if settings.send_originals_as_files:
                 await message.answer("📎 Отправляю оригиналы без сжатия как файлы…")
-                await send_documents(
+                originals_sent = await send_documents(
                     bot,
                     message.chat.id,
                     [item.path for item in originals],
                     caption="Оригиналы без сжатия",
                 )
-            await message.answer(f"✅ Готово!\nОбработано фотографий: {len(processed)}")
-            return len(processed)
+            if sent_photos == 0 and originals_sent == 0:
+                raise TelegramDeliveryError("Telegram не принял ни одного фото — попробуй ещё раз позже")
+            failed = max(0, len(processed) - sent_photos)
+            summary = f"✅ Готово!\nОтправлено обработанных фото: {sent_photos}"
+            if failed:
+                summary += f"\n⚠️ Не удалось отправить: {failed}"
+            await message.answer(summary)
+            return sent_photos
 
 
 @router.message(F.text)
@@ -153,6 +179,15 @@ async def listing_handler(
         await database.fail_job(job_id, str(exc))
         logger.warning("Ошибка источника для пользователя %s: %s", user_id, exc)
         await message.answer(messages.DOWNLOAD_ERROR)
+    except TelegramDeliveryError as exc:
+        await database.fail_job(job_id, str(exc))
+        logger.warning("Telegram не принял медиа для пользователя %s: %s", user_id, exc)
+        await message.answer(
+            "⚠️ Telegram отклонил отправку фотографий. Попробуй ещё раз через минуту."
+        )
+    except TelegramAPIError as exc:
+        await database.fail_job(job_id, str(exc))
+        logger.exception("Ошибка Telegram API для пользователя %s: %s", user_id, exc)
     except Exception as exc:
         await database.fail_job(job_id, str(exc))
         logger.exception("Необработанная ошибка для пользователя %s", user_id)
