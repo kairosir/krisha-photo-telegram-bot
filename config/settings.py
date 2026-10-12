@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     global_processing_limit: int = Field(default=4, ge=1, le=32)
     download_concurrency: int = Field(default=5, ge=1, le=20)
     send_originals_as_files: bool = True
+    camoufox_persistent_root: str | None = None
     user_agent: str = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 KrishaPhotoBot/1.0"
