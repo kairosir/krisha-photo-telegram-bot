@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     global_processing_limit: int = Field(default=4, ge=1, le=32)
     download_concurrency: int = Field(default=5, ge=1, le=20)
     send_originals_as_files: bool = True
+    use_lama: bool = True
+    lama_model_dir: str | None = None
     camoufox_persistent_root: str | None = None
     user_agent: str = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
