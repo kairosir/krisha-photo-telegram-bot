@@ -37,12 +37,7 @@ class ImageProcessingError(RuntimeError):
 
 
 class _LamaEngine:
-    """Ленивая singleton-обёртка над TorchScript-моделью LaMa (MIT лицензия).
-
-    Модель скачивается один раз (~200 МБ) и держится в памяти. Инференс
-    защищён lock'ом: torch сам по себе потокобезопасен только для eval,
-    но память ограничена, поэтому параллелим не больше OMP threads.
-    """
+    """Ленивая singleton-обёртка над TorchScript-моделью LaMa (MIT лицензия)."""
 
     _lock = threading.Lock()
     _model = None
@@ -279,13 +274,6 @@ class ImageProcessor:
             mask[component] = 255
 
         # --- Групповой проход для тайлинговых знаков -------------------------
-        # Полупрозрачные знаки, набросанные сеткой по всему кадру, дают много
-        # мелких компонентов; одиночный глиф ниже min_group_area отбрасывался
-        # как шум и такие кадры оставались необработанными. Если похожих на
-        # символы компонентов много и они распределены по разным регионам
-        # кадра регулярно — это паттерн тайлинга: строим кластерные bbox
-        # (каждый повтор знака) и заполняем их всей мягкой зоной знака,
-        # включая ореол, который точечная маска глифов не захватывает.
         tiling_boxes = self._tiling_boxes(labels, stats, centroids, width, height)
         if tiling_boxes is not None:
             for x, y, bw, bh in tiling_boxes:
@@ -307,9 +295,7 @@ class ImageProcessor:
             return final
 
         # Дорастить до реальных границ штриха (антиалиасинг букв). Порог берём
-        # ОТНОСИТЕЛЬНО контраста самих найденных глифов: абсолютный порог
-        # либо не дотягивает до мягких краёв полупрозрачного знака, либо ловит
-        # шум фона. Ограничиваем доращивание окрестностью маски + ореол.
+        # ОТНОСИТЕЛЬНО контраста самих найденных глифов.
         comp_med = float(np.median(resp[mask > 0]))
         stroke_thr = max(thr * 0.45, comp_med * 0.3)
         stroke = (resp > stroke_thr).astype(np.uint8) * 255
@@ -345,7 +331,6 @@ class ImageProcessor:
             return None
 
         pts = centroids[cand_ids]
-        # Разбиваем кадр на 4x4 региона: тайлинг даёт компоненты по всей площади
         regions: set[tuple[int, int]] = set()
         for cx, cy in pts:
             regions.add((min(3, int(cx / width * 4)), min(3, int(cy / height * 4))))
@@ -360,7 +345,6 @@ class ImageProcessor:
         if len(consistent) < 12:
             return None
 
-        # Кластеризация центров повторами знака (eps ≈ медианный шаг сетки)
         pts_c = centroids[consistent]
         sizes = np.array([stats[i, cv2.CC_STAT_WIDTH] for i in consistent], dtype=np.float64)
         med_w = float(np.median(sizes)) if len(sizes) else 20.0
@@ -402,7 +386,6 @@ class ImageProcessor:
             x2 = min(width, int(xs.max() + pad_x))
             y2 = min(height, int(ys.max() + pad_y))
             bw, bh = x2 - x1, y2 - y1
-            # Повтор знака не должен быть больше ~35% кадра по каждой оси
             if bw > 0.35 * width or bh > 0.35 * height:
                 continue
             boxes.append((x1, y1, bw, bh))
@@ -441,8 +424,6 @@ class ImageProcessor:
         destination: Path,
         jpeg_quality: int,
     ) -> None:
-        # Сохраняем через Pillow: у cv2.imwrite свои дефолтные уровни качества,
-        # из-за которых даже «пустая» обработка заметно портила бы JPEG.
         if alpha is not None:
             rgba = cv2.cvtColor(result, cv2.COLOR_BGR2RGBA)
             rgba[:, :, 3] = alpha
@@ -478,7 +459,6 @@ class ImageProcessor:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         has_explicit = bool(regions) or mask_path is not None
-        # Без явных указаний и без авто-режима — сохраняем байт-в-байт оригинал
         if not has_explicit and not auto_remove_watermark:
             shutil.copy2(source, destination)
             return destination
@@ -506,26 +486,35 @@ class ImageProcessor:
             mask = cv2.bitwise_or(mask, detected)
 
         if not mask.any():
-            # Ничего не нашли — переупаковываем без потерь качества вместо битого JPEG-перекодирования
             shutil.copy2(source, destination)
             return destination
 
-        # Расширяем маску: полупрозрачные знаки имеют мягкие края, которые
-        # детектор захватывает не полностью; без буфера LaMa оставит ореол.
         work_mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
 
         result = None
         if self._use_lama:
             try:
-                result = _LamaEngine.inpaint(image, work_mask, self._lama_model_dir)
+                # Даунскейл до 800px: LaMa работает быстрее на меньшем разрешении,
+                # а штрихи знака остаются различимыми после апскейла обратно.
+                scale = 1.0
+                if max(height, width) > 800:
+                    scale = 800.0 / max(height, width)
+                    small_img = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                    small_mask = cv2.resize(work_mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+                    result_small = _LamaEngine.inpaint(small_img, small_mask, self._lama_model_dir)
+                    result_full = cv2.resize(result_small, (width, height), interpolation=cv2.INTER_CUBIC)
+                    # Апскейл смазывает границы, но фон восстанавливается хорошо;
+                    # штрихи знака всё равно удалены, поэтому дорабатываем остаток
+                    # локальным порогом в ПОЛНОМ разрешении.
+                    result = result_full
+                else:
+                    result = _LamaEngine.inpaint(image, work_mask, self._lama_model_dir)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LaMa недоступна (%s), откат на OpenCV TELEA", exc)
                 self._use_lama = False
         if result is None:
             result = cv2.inpaint(image, work_mask, self._inpaint_radius, cv2.INPAINT_TELEA)
 
-        # Итеративная доработка остатков (полезна в обоих режимах: у LaMa тоже
-        # бывают пропуски на самых плотных тайлинговых знаках).
         band_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         outer_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
         passes = 1 if self._use_lama else 2
