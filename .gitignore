@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+downloads/
+temp/input/*
+temp/output/*
+!temp/input/.gitkeep
+!temp/output/.gitkeep
+data/
+models/*.pt
